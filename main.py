@@ -4,7 +4,7 @@ load_dotenv()
 from fastapi import FastAPI, Depends, HTTPException, Request, status
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from pydantic import BaseModel
-from passlib.context import CryptContext
+import bcrypt
 from jose import JWTError, jwt
 from sqlalchemy.orm import Session
 from datetime import datetime, timedelta
@@ -18,20 +18,27 @@ import uuid
 import os
 
 # ── Config (all values come from .env) ────────────────────────────────────────
-SECRET_KEY = os.environ["SECRET_KEY"]                       # required — no default
+SECRET_KEY = os.environ["SECRET_KEY"]
 ALGORITHM  = os.getenv("ALGORITHM", "HS256")
-ACCESS_TOKEN_EXPIRE_MINUTES  = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "15"))
-REFRESH_TOKEN_EXPIRE_DAYS    = int(os.getenv("REFRESH_TOKEN_EXPIRE_DAYS", "7"))
+ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "15"))
+REFRESH_TOKEN_EXPIRE_DAYS   = int(os.getenv("REFRESH_TOKEN_EXPIRE_DAYS", "7"))
 
 # ── App ───────────────────────────────────────────────────────────────────────
 app = FastAPI(title="Auth Server")
-pwd_context  = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
 
 
 @app.on_event("startup")
 def startup():
     create_tables()
+
+
+# ── Password helpers ──────────────────────────────────────────────────────────
+def hash_password(password: str) -> str:
+    return bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
+
+def verify_password(password: str, hashed: str) -> bool:
+    return bcrypt.checkpw(password.encode(), hashed.encode())
 
 
 # ── Schemas ───────────────────────────────────────────────────────────────────
@@ -101,7 +108,7 @@ def register(body: UserRegister, db: Session = Depends(get_db)):
         raise HTTPException(status_code=400, detail="Username already taken")
     user = User(
         username=body.username,
-        hashed_password=pwd_context.hash(body.password),
+        hashed_password=hash_password(body.password),
     )
     db.add(user)
     db.commit()
@@ -112,14 +119,13 @@ def register(body: UserRegister, db: Session = Depends(get_db)):
 def login(form: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
     user = db.query(User).filter(User.username == form.username).first()
 
-    # Deliberately vague error to avoid user enumeration
     invalid = HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
 
     if not user:
         raise invalid
     if is_locked_out(user):
         raise HTTPException(status_code=status.HTTP_423_LOCKED, detail="Account temporarily locked")
-    if not pwd_context.verify(form.password, user.hashed_password):
+    if not verify_password(form.password, user.hashed_password):
         record_failed_login(db, user)
         raise invalid
 
@@ -132,7 +138,7 @@ def refresh(body: RefreshRequest):
     if not refresh_token_exists(body.refresh_token):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Unknown refresh token")
     username = decode_token(body.refresh_token, "refresh")
-    revoke_refresh_token(body.refresh_token)   # rotate — old token gone immediately
+    revoke_refresh_token(body.refresh_token)
     return create_token_pair(username)
 
 
