@@ -1,25 +1,34 @@
-from fastapi import FastAPI, Depends, HTTPException, status
+from fastapi import FastAPI, Depends, HTTPException, Request, status
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from pydantic import BaseModel
 from passlib.context import CryptContext
 from jose import JWTError, jwt
+from sqlalchemy.orm import Session
 from datetime import datetime, timedelta
+from database import User, get_db, create_tables
+from redis_store import (
+    store_refresh_token, refresh_token_exists,
+    revoke_refresh_token, check_rate_limit,
+)
+from security import record_failed_login, reset_failed_logins, is_locked_out
 import uuid
+import os
 
-# ── Config ────────────────────────────────────────────────────────────────────
-SECRET_KEY = "change-me-in-production"          # openssl rand -hex 32
-ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 15
-REFRESH_TOKEN_EXPIRE_DAYS = 7
+# ── Config (all values come from .env) ────────────────────────────────────────
+SECRET_KEY = os.environ["SECRET_KEY"]                       # required — no default
+ALGORITHM  = os.getenv("ALGORITHM", "HS256")
+ACCESS_TOKEN_EXPIRE_MINUTES  = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "15"))
+REFRESH_TOKEN_EXPIRE_DAYS    = int(os.getenv("REFRESH_TOKEN_EXPIRE_DAYS", "7"))
 
-# ── App & helpers ─────────────────────────────────────────────────────────────
+# ── App ───────────────────────────────────────────────────────────────────────
 app = FastAPI(title="Auth Server")
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+pwd_context  = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
 
-# ── Fake DB (replace with a real one) ────────────────────────────────────────
-USERS_DB: dict[str, dict] = {}
-REFRESH_TOKENS: set[str] = set()   # store in Redis / DB in production
+
+@app.on_event("startup")
+def startup():
+    create_tables()
 
 
 # ── Schemas ───────────────────────────────────────────────────────────────────
@@ -38,8 +47,7 @@ class RefreshRequest(BaseModel):
 
 # ── Token helpers ─────────────────────────────────────────────────────────────
 def create_token(data: dict, expires_delta: timedelta) -> str:
-    payload = data.copy()
-    payload.update({"exp": datetime.utcnow() + expires_delta, "jti": str(uuid.uuid4())})
+    payload = {**data, "exp": datetime.utcnow() + expires_delta, "jti": str(uuid.uuid4())}
     return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
 
 def create_token_pair(username: str) -> TokenPair:
@@ -51,65 +59,86 @@ def create_token_pair(username: str) -> TokenPair:
         {"sub": username, "type": "refresh"},
         timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS),
     )
-    REFRESH_TOKENS.add(refresh)
+    store_refresh_token(refresh)
     return TokenPair(access_token=access, refresh_token=refresh)
 
 def decode_token(token: str, expected_type: str) -> str:
-    """Decode a JWT and return the username, or raise 401."""
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
         if payload.get("type") != expected_type:
-            raise ValueError("wrong token type")
-        username: str = payload["sub"]
-        return username
+            raise ValueError
+        return payload["sub"]
     except (JWTError, ValueError, KeyError):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
 
 
-# ── Dependency: current user from access token ────────────────────────────────
-def get_current_user(token: str = Depends(oauth2_scheme)) -> dict:
+# ── Rate-limit dependency ─────────────────────────────────────────────────────
+def rate_limit(request: Request):
+    ip = request.client.host
+    if not check_rate_limit(ip):
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail="Too many requests")
+
+
+# ── Current-user dependency ───────────────────────────────────────────────────
+def get_current_user(
+    token: str = Depends(oauth2_scheme),
+    db: Session = Depends(get_db),
+) -> User:
     username = decode_token(token, "access")
-    user = USERS_DB.get(username)
-    if not user:
+    user = db.query(User).filter(User.username == username).first()
+    if not user or not user.is_active:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
     return user
 
 
 # ── Routes ────────────────────────────────────────────────────────────────────
-@app.post("/auth/register", status_code=status.HTTP_201_CREATED)
-def register(body: UserRegister):
-    if body.username in USERS_DB:
+@app.post("/auth/register", status_code=status.HTTP_201_CREATED, dependencies=[Depends(rate_limit)])
+def register(body: UserRegister, db: Session = Depends(get_db)):
+    if db.query(User).filter(User.username == body.username).first():
         raise HTTPException(status_code=400, detail="Username already taken")
-    USERS_DB[body.username] = {
-        "username": body.username,
-        "hashed_password": pwd_context.hash(body.password),
-    }
+    user = User(
+        username=body.username,
+        hashed_password=pwd_context.hash(body.password),
+    )
+    db.add(user)
+    db.commit()
     return {"message": "User created"}
 
 
-@app.post("/auth/login", response_model=TokenPair)
-def login(form: OAuth2PasswordRequestForm = Depends()):
-    user = USERS_DB.get(form.username)
-    if not user or not pwd_context.verify(form.password, user["hashed_password"]):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Bad credentials")
-    return create_token_pair(form.username)
+@app.post("/auth/login", response_model=TokenPair, dependencies=[Depends(rate_limit)])
+def login(form: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
+    user = db.query(User).filter(User.username == form.username).first()
+
+    # Deliberately vague error to avoid user enumeration
+    invalid = HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
+
+    if not user:
+        raise invalid
+    if is_locked_out(user):
+        raise HTTPException(status_code=status.HTTP_423_LOCKED, detail="Account temporarily locked")
+    if not pwd_context.verify(form.password, user.hashed_password):
+        record_failed_login(db, user)
+        raise invalid
+
+    reset_failed_logins(db, user)
+    return create_token_pair(user.username)
 
 
-@app.post("/auth/refresh", response_model=TokenPair)
+@app.post("/auth/refresh", response_model=TokenPair, dependencies=[Depends(rate_limit)])
 def refresh(body: RefreshRequest):
-    if body.refresh_token not in REFRESH_TOKENS:
+    if not refresh_token_exists(body.refresh_token):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Unknown refresh token")
     username = decode_token(body.refresh_token, "refresh")
-    REFRESH_TOKENS.discard(body.refresh_token)   # rotate: old token is gone
+    revoke_refresh_token(body.refresh_token)   # rotate — old token gone immediately
     return create_token_pair(username)
 
 
 @app.post("/auth/logout")
 def logout(body: RefreshRequest):
-    REFRESH_TOKENS.discard(body.refresh_token)
+    revoke_refresh_token(body.refresh_token)
     return {"message": "Logged out"}
 
 
 @app.get("/me")
-def me(current_user: dict = Depends(get_current_user)):
-    return {"username": current_user["username"]}
+def me(current_user: User = Depends(get_current_user)):
+    return {"username": current_user.username, "created_at": current_user.created_at}

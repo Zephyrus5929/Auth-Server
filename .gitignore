@@ -14,3 +14,29 @@ crash.log
 
 # For built boxes
 *.box
+
+# Environment & secrets
+.env
+*.env
+
+# SQLite database
+*.db
+*.db-shm
+*.db-wal
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+
+# UV / pip
+*.egg-info/
+dist/
+build/
+
+# OS
+.DS_Store
+Thumbs.db
