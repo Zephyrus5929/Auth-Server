@@ -1,76 +1,91 @@
-# Auth Server — FastAPI + JWT (Production-ready)
+# Auth Server
 
-## Files
+A production-ready auth server built with FastAPI, JWT, SQLite, and Redis.
 
-| File | Purpose |
-|------|---------|
-| `main.py` | FastAPI app — routes, token logic, rate limiting |
-| `database.py` | SQLAlchemy models + SQLite session |
-| `redis_store.py` | Refresh token storage + rate limiting via Redis |
-| `security.py` | Brute-force lockout helpers |
-| `.env.example` | All configurable values |
+## Features
+
+- JWT access + refresh tokens with rotation
+- bcrypt password hashing
+- SQLite database via SQLAlchemy
+- Redis-backed refresh token storage
+- Rate limiting (20 req/min per IP)
+- Brute-force lockout (5 failed attempts → 15 min lockout)
+- User enumeration prevention
+
+## Prerequisites
+
+- [Docker Desktop](https://www.docker.com/products/docker-desktop/) (recommended)
+- Or: Python 3.12+ and a Redis-compatible server (e.g. [Memurai](https://www.memurai.com/) on Windows)
 
 ## Setup
 
+**1. Clone the repo**
 ```bash
-pip install -r requirements.txt
-cp .env.example .env          # then edit SECRET_KEY at minimum
-uvicorn main:app --reload     # dev
-uvicorn main:app --workers 4  # prod
+git clone https://github.com/Zephyrus5929/Auth-Server
+cd Auth-Server
 ```
 
-Interactive docs → **http://localhost:8000/docs**
+**2. Create your `.env`**
+```bash
+cp .env.example .env   # Windows: copy .env.example .env
+```
 
-## Configuration (.env)
+Edit `.env` and set your secret key — generate one with:
+```bash
+python -c "import secrets; print(secrets.token_hex(32))"
+```
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `SECRET_KEY` | **required** | JWT signing key — `openssl rand -hex 32` |
-| `DATABASE_URL` | `sqlite:///./auth.db` | SQLAlchemy connection string |
-| `REDIS_URL` | `redis://localhost:6379/0` | Redis for refresh tokens + rate limits |
-| `ACCESS_TOKEN_EXPIRE_MINUTES` | `15` | Access token lifetime |
-| `REFRESH_TOKEN_EXPIRE_DAYS` | `7` | Refresh token lifetime |
-| `RATE_LIMIT_PER_MINUTE` | `20` | Max requests per IP per minute |
-| `MAX_FAILED_ATTEMPTS` | `5` | Failed logins before lockout |
-| `LOCKOUT_MINUTES` | `15` | How long accounts stay locked |
+**3. Run**
+
+With Docker (recommended):
+```bash
+docker compose up --build
+```
+
+Without Docker:
+```bash
+pip install -r requirements.txt
+uvicorn main:app --reload
+```
+
+Server runs at **http://localhost:8000** — interactive docs at **http://localhost:8000/docs**
 
 ## Endpoints
 
 | Method | Path | Auth | Description |
 |--------|------|------|-------------|
 | POST | `/auth/register` | — | Create account |
-| POST | `/auth/login` | — | Returns token pair |
+| POST | `/auth/login` | — | Returns access + refresh tokens |
 | POST | `/auth/refresh` | — | Rotate refresh token |
 | POST | `/auth/logout` | — | Revoke refresh token |
 | GET | `/me` | Bearer | Current user info |
 
-## Security features
+## Configuration
 
-- **bcrypt** password hashing
-- **Short-lived access tokens** (15 min), **long-lived refresh tokens** (7 days)
-- **Refresh token rotation** — each use invalidates the old token
-- **Redis-backed token store** — survives restarts, tokens revocable instantly
-- **Rate limiting** — 20 req/min per IP, tracked in Redis
-- **Brute-force lockout** — account locked for 15 min after 5 bad passwords
-- **User enumeration prevention** — same error for bad username or bad password
+All config is via `.env`. See `.env.example` for all options.
 
-## Switching to Postgres later
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `SECRET_KEY` | **required** | JWT signing key |
+| `DATABASE_URL` | `sqlite:///./data/auth.db` | SQLAlchemy connection string |
+| `REDIS_URL` | `redis://localhost:6379/0` | Redis connection string |
+| `ACCESS_TOKEN_EXPIRE_MINUTES` | `15` | Access token lifetime |
+| `REFRESH_TOKEN_EXPIRE_DAYS` | `7` | Refresh token lifetime |
+| `RATE_LIMIT_PER_MINUTE` | `20` | Max requests per IP per minute |
+| `MAX_FAILED_ATTEMPTS` | `5` | Failed logins before lockout |
+| `LOCKOUT_MINUTES` | `15` | Lockout duration |
+
+## Token Flow
 
 ```
-DATABASE_URL=postgresql://user:password@localhost:5432/authdb
-```
-The `connect_args` in `database.py` is already conditional on the URL prefix.
-
-## Running behind a reverse proxy (Nginx / Caddy)
-
-Forward the real client IP so rate limiting works correctly:
-
-```nginx
-proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+register → login → { access_token, refresh_token }
+                         │                │
+                  use for API calls    store securely
+                  (15 min lifetime)    swap for new pair
+                                       when access expires
 ```
 
-And add `--proxy-headers` to your uvicorn command:
-
-```bash
-uvicorn main:app --workers 4 --proxy-headers --forwarded-allow-ips='*'
+Use the access token in the `Authorization` header:
+```
+Authorization: Bearer <access_token>
 ```
